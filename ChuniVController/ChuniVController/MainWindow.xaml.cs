@@ -26,6 +26,8 @@ namespace ChuniVController
         private void handleRecv(ChuniIoMessage message)
         {
             if (message.Source != (byte)ChuniMessageSources.Game || message.Type != (byte)ChuniMessageTypes.LedSet || message.Target >= 16) return;
+            if (touchpads == null) return;
+
             touchpads[message.Target].LedStrip.Dispatcher.BeginInvoke(
                 (Action) (() => touchpads[15 - message.Target].LedStrip.Fill =
                     new SolidColorBrush(Color.FromRgb(message.LedColorRed, message.LedColorGreen,
@@ -35,7 +37,7 @@ namespace ChuniVController
         public MainWindow()
         {
             InitializeComponent();
-            cio = new ChuniIO("127.0.0.1", 24864, handleRecv);
+            cio = new ChuniIO(handleRecv);
             cio.Start();
 
             HotkeyManager.Current.AddOrReplace("Lock", Key.L, ModifierKeys.Alt, ToggleLockWindow);

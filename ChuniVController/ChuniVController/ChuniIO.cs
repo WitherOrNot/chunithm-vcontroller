@@ -8,6 +8,8 @@ using System.Text;
 using System.Threading.Tasks;
 using System.Runtime.InteropServices;
 using System.Threading;
+using System.IO.MemoryMappedFiles;
+using System.Windows.Documents;
 
 namespace ChuniVController
 {
@@ -39,71 +41,89 @@ namespace ChuniVController
         public byte LedColorBlue;
     }
 
+    [StructLayout(LayoutKind.Sequential, Pack = 1)]
+    public unsafe struct IPCMemoryInfo
+    {
+        public fixed byte airIoStatus[6];
+        public fixed byte sliderIoStatus[32];
+        public fixed byte ledRgbData[32 * 3];
+        public byte testBtn;
+        public byte serviceBtn;
+        public byte coinInsertion;
+        public byte cardRead;
+        public byte remoteCardRead;
+        public byte remoteCardType;
+        public fixed byte remoteCardId[10];
+    }
+
     public class ChuniIO
     {
-        private readonly UdpClient _client;
-        private readonly string _ioServerAddress;
-        private readonly int _port;
         private bool _running;
-        private byte[] _sendBuffer;
-        private readonly IntPtr _sendBufferUnmanaged;
         private readonly RecvCallback _recvCallback;
         private Thread _recvThread;
+        private MemoryMappedFile _ipcFile;
+        private MemoryMappedViewAccessor _ipc;
 
         private struct RecvContext
         {
-            public UdpClient client;
+            public MemoryMappedViewAccessor ipc;
             public RecvCallback callback;
         }
 
         public delegate void RecvCallback(ChuniIoMessage message);
 
-        public ChuniIO(string ioServerAddress, int port, RecvCallback recvCallback)
+        public ChuniIO(RecvCallback recvCallback)
         {
-            _ioServerAddress = ioServerAddress;
-            _port = port;
             _running = false;
-            _client = new UdpClient();
-            _sendBuffer = new byte[32];
-            _sendBufferUnmanaged = Marshal.AllocHGlobal(32);
-            
             _recvCallback = recvCallback;
         }
 
         ~ChuniIO()
         {
-            Marshal.FreeHGlobal(_sendBufferUnmanaged);
+            _ipc.Dispose();
+            _ipcFile.Dispose();
         }
 
         private static void RecvThread(object c)
         {
-            ChuniIoMessage message = new ChuniIoMessage();
-            int sz = Marshal.SizeOf(message);
-            IPEndPoint endpoint = new IPEndPoint(IPAddress.Any, 0);
-            IntPtr recvBufferPtr;
-            recvBufferPtr = Marshal.AllocHGlobal(32);
-
-            RecvContext context = (RecvContext) c;
-
-            try
+            unsafe
             {
-                while (true)
+                RecvContext context = (RecvContext) c;
+                byte* rgbState = (byte*)Marshal.AllocHGlobal(96).ToPointer();
+
+                try
                 {
-                    byte[] recvBuffer = context.client.Receive(ref endpoint);
-                    if (recvBuffer.Length == 0) break;
-                    if (recvBuffer.Length != sz) continue;
-                    Marshal.Copy(recvBuffer, 0, recvBufferPtr, sz);
-                    message = (ChuniIoMessage)Marshal.PtrToStructure(recvBufferPtr, message.GetType());
-                    context.callback(message);
+                    while (true)
+                    {
+                        IPCMemoryInfo info;
+                        context.ipc.Read(0, out info);
+
+                        bool same = true;
+                        int target = 0;
+                        for (int i = 0; i < 96; i++) 
+                        {
+                            if (rgbState[i] != info.ledRgbData[i])
+                            {
+                                target = i / 3;
+                                var msg = new ChuniIoMessage();
+                                msg.Source = (byte)ChuniMessageSources.Game;
+                                msg.Type = (byte)ChuniMessageTypes.LedSet;
+                                msg.Target = (byte)(i / 6);
+                                msg.LedColorRed = info.ledRgbData[3 * target + 1];
+                                msg.LedColorGreen = info.ledRgbData[3 * target + 2];
+                                msg.LedColorBlue = info.ledRgbData[3 * target];
+                                context.callback(msg);
+                            }
+                        }
+
+                        Buffer.MemoryCopy(info.ledRgbData, rgbState, 96, 96);
+                    }
+                }
+                catch 
+                {
+                    // noting, just exit.
                 }
             }
-            catch 
-            {
-                // noting, just exit.
-            }
-            
-
-            Marshal.FreeHGlobal(recvBufferPtr);
         }
 
         public bool Start()
@@ -111,7 +131,8 @@ namespace ChuniVController
             if (_running) return false;
             try
             {
-                _client.Connect(_ioServerAddress, _port);
+                _ipcFile = MemoryMappedFile.OpenExisting("Local\\BROKENITHM_SHARED_BUFFER", MemoryMappedFileRights.ReadWrite);
+                _ipc = _ipcFile.CreateViewAccessor();
             }
             catch
             {
@@ -119,7 +140,7 @@ namespace ChuniVController
             }
 
             RecvContext c = new RecvContext();
-            c.client = _client;
+            c.ipc = _ipc;
             c.callback = _recvCallback;
 
             _recvThread = new Thread(RecvThread);
@@ -134,7 +155,8 @@ namespace ChuniVController
             if (!_running) return false;
             try
             {
-                _client.Close();
+                _ipc.Dispose();
+                _ipcFile.Dispose();
             }
             catch 
             {
@@ -153,15 +175,36 @@ namespace ChuniVController
             // don't care
         }
 
-        public void Send(ChuniIoMessage message)
+        public void Send(ChuniIoMessage msg)
         {
-            int sz = Marshal.SizeOf(message);
-            Marshal.StructureToPtr(message, _sendBufferUnmanaged, false);
-            Marshal.Copy(_sendBufferUnmanaged, _sendBuffer, 0, sz);
-            _client.BeginSend(_sendBuffer, sz, SendCallback, null);
+            int sliderIndex = 6 + 2 * msg.Target;
+            int airIndex = msg.Target;
+            if (airIndex % 2 == 0) airIndex++; else airIndex--;
+
+            switch ((ChuniMessageTypes)msg.Type) {
+                case ChuniMessageTypes.SliderPress:
+                    if (msg.Target > 15) return;
+
+                    _ipc.Write(sliderIndex, (byte)128);
+                    _ipc.Write(sliderIndex + 1, (byte)128);
+                    break;
+                case ChuniMessageTypes.SliderRelease:
+                    if (msg.Target > 15) return;
+
+                    _ipc.Write(sliderIndex, (byte)0);
+                    _ipc.Write(sliderIndex + 1, (byte)0);
+                    break;
+                case ChuniMessageTypes.IrBlocked:
+                    if (msg.Target > 5) return;
+
+                    _ipc.Write(airIndex, (byte)1);
+                    break;
+                case ChuniMessageTypes.IrUnblocked:
+                    if (msg.Target > 5) return;
+
+                    _ipc.Write(airIndex, (byte)0);
+                    break;
+            }
         }
-
-         
-
     }
 }
